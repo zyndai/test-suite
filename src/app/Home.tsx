@@ -122,7 +122,7 @@ const ZyndTester: React.FC = () => {
 
       const fetchWithPay = wrapFetchWithPayment(
         fetch,
-        walletClient,
+        walletClient as any,
         amountInBaseUnits
       );
 

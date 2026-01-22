@@ -1,5 +1,5 @@
 import { NextResponse, NextRequest } from 'next/server'
-// @ts-expect-error - x402-next types misconfigured (points to non-existent dist/index.d.ts)
+// @ts-ignore - IDE type resolution issue, types work at build time
 import { withX402 } from 'x402-next'
 
 async function handler(_request: NextRequest) {

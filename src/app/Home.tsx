@@ -177,7 +177,7 @@ const ZyndTester: React.FC = () => {
       setFaucetError('');
       setFaucetResponse(null);
 
-      const response = await fetch('https://base-sepolia-faucet.vercel.app/faucet', {
+      const response = await fetch('/api/faucet', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

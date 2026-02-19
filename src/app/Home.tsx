@@ -1,7 +1,13 @@
-import React, { useState, useEffect } from 'react';
+'use client';
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import Link from 'next/link';
 import { createWalletClient, custom } from 'viem';
 import { baseSepolia } from 'viem/chains';
 import { wrapFetchWithPayment } from 'x402-fetch';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { config } from './config';
 
 declare global {
   interface Window {
@@ -9,107 +15,355 @@ declare global {
   }
 }
 
-type TabType = 'tester' | 'faucet';
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant' | 'error';
+  content: string;
+  timestamp: number;
+}
+
+interface Conversation {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: number;
+  updatedAt: number;
+  apiUrl: string;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+const generateId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+const loadConversations = (): Conversation[] => {
+  try {
+    const raw = localStorage.getItem(config.storage.conversations);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+};
+
+const saveConversations = (convos: Conversation[]) => {
+  localStorage.setItem(config.storage.conversations, JSON.stringify(convos));
+};
+
+const loadActiveId = (): string | null => {
+  try {
+    return localStorage.getItem(config.storage.activeConversation);
+  } catch {
+    return null;
+  }
+};
+
+const saveActiveId = (id: string | null) => {
+  if (id) localStorage.setItem(config.storage.activeConversation, id);
+  else localStorage.removeItem(config.storage.activeConversation);
+};
+
+const loadSavedApiUrl = (): string => {
+  try {
+    return localStorage.getItem(config.storage.apiUrl) || config.apiUrl;
+  } catch {
+    return config.apiUrl;
+  }
+};
+
+const saveApiUrl = (url: string) => {
+  localStorage.setItem(config.storage.apiUrl, url);
+};
+
+/**
+ * Extract a short title from the first user message (first ~40 chars).
+ */
+const deriveTitle = (text: string): string => {
+  const clean = text.replace(/\n/g, ' ').trim();
+  return clean.length > 40 ? `${clean.slice(0, 40)}...` : clean;
+};
+
+/**
+ * Try to extract readable text from an API response object.
+ */
+const extractContent = (data: any): string => {
+  if (typeof data === 'string') return data;
+
+  // Common LLM response shapes
+  if (data?.choices?.[0]?.message?.content) return data.choices[0].message.content;
+  if (data?.choices?.[0]?.text) return data.choices[0].text;
+  if (data?.result) return typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
+  if (data?.response) return typeof data.response === 'string' ? data.response : JSON.stringify(data.response, null, 2);
+  if (data?.message) return typeof data.message === 'string' ? data.message : JSON.stringify(data.message, null, 2);
+  if (data?.content) return typeof data.content === 'string' ? data.content : JSON.stringify(data.content, null, 2);
+  if (data?.output) return typeof data.output === 'string' ? data.output : JSON.stringify(data.output, null, 2);
+  if (data?.text) return typeof data.text === 'string' ? data.text : JSON.stringify(data.text, null, 2);
+  if (data?.answer) return typeof data.answer === 'string' ? data.answer : JSON.stringify(data.answer, null, 2);
+  if (data?.data) {
+    if (typeof data.data === 'string') return data.data;
+    // Recurse one level for wrapped responses
+    return extractContent(data.data);
+  }
+
+  return '```json\n' + JSON.stringify(data, null, 2) + '\n```';
+};
+
+// ── Markdown renderer components ───────────────────────────────────────────
+
+const markdownComponents: Record<string, React.FC<any>> = {
+  p: ({ children }: any) => <p className="mb-3 last:mb-0 leading-relaxed">{children}</p>,
+  h1: ({ children }: any) => <h1 className="text-xl font-bold mb-3 mt-4 first:mt-0">{children}</h1>,
+  h2: ({ children }: any) => <h2 className="text-lg font-bold mb-2 mt-3 first:mt-0">{children}</h2>,
+  h3: ({ children }: any) => <h3 className="text-base font-semibold mb-2 mt-3 first:mt-0">{children}</h3>,
+  ul: ({ children }: any) => <ul className="list-disc list-inside mb-3 space-y-1">{children}</ul>,
+  ol: ({ children }: any) => <ol className="list-decimal list-inside mb-3 space-y-1">{children}</ol>,
+  li: ({ children }: any) => <li className="leading-relaxed">{children}</li>,
+  code: ({ className, children, ...props }: any) => {
+    const isInline = !className;
+    if (isInline) {
+      return (
+        <code className="bg-white/10 rounded px-1.5 py-0.5 text-sm font-mono text-emerald-300" {...props}>
+          {children}
+        </code>
+      );
+    }
+    return (
+      <div className="my-3 rounded-lg overflow-hidden border border-white/10">
+        <div className="bg-white/5 px-4 py-2 text-xs text-gray-400 font-mono border-b border-white/10">
+          {className?.replace('language-', '') || 'code'}
+        </div>
+        <pre className="bg-black/40 p-4 overflow-x-auto">
+          <code className="text-sm font-mono text-gray-200" {...props}>{children}</code>
+        </pre>
+      </div>
+    );
+  },
+  blockquote: ({ children }: any) => (
+    <blockquote className="border-l-2 border-violet-500 pl-4 my-3 text-gray-300 italic">{children}</blockquote>
+  ),
+  table: ({ children }: any) => (
+    <div className="overflow-x-auto my-3">
+      <table className="min-w-full border-collapse border border-white/10">{children}</table>
+    </div>
+  ),
+  th: ({ children }: any) => (
+    <th className="border border-white/10 px-3 py-2 bg-white/5 text-left text-sm font-semibold">{children}</th>
+  ),
+  td: ({ children }: any) => (
+    <td className="border border-white/10 px-3 py-2 text-sm">{children}</td>
+  ),
+  a: ({ href, children }: any) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" className="text-violet-400 hover:text-violet-300 underline">
+      {children}
+    </a>
+  ),
+  hr: () => <hr className="my-4 border-white/10" />,
+  strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
+};
+
+// ── Main Component ─────────────────────────────────────────────────────────
 
 const ZyndTester: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<TabType>('tester');
-  const [walletAddress, setWalletAddress] = useState<string>('');
-  const [isConnected, setIsConnected] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [response, setResponse] = useState<any>(null);
-  const [error, setError] = useState<string>('');
-  const [paymentInfo, setPaymentInfo] = useState<string>('');
+  // Wallet
+  const [walletAddress, setWalletAddress] = useState('');
+  const [isConnected, setIsConnected] = useState(false);
 
-  // API Tester form inputs
-  const [apiUrl, setApiUrl] = useState<string>('');
-  const [amount, setAmount] = useState<string>('0.01');
-  const [prompt, setPrompt] = useState<string>('');
+  // Conversations
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
 
-  // Faucet form inputs
-  const [faucetAddress, setFaucetAddress] = useState<string>('');
-  const [faucetLoading, setFaucetLoading] = useState<boolean>(false);
-  const [faucetResponse, setFaucetResponse] = useState<any>(null);
-  const [faucetError, setFaucetError] = useState<string>('');
+  // Input
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  // Sidebar
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  // Settings
+  const [apiUrl, setApiUrl] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Refs
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── Derived state ──────────────────────────────────────────────────────
+
+  const activeConvo = conversations.find((c) => c.id === activeConvoId) || null;
+  const messages = activeConvo?.messages || [];
+
+  // ── Persistence: load on mount ─────────────────────────────────────────
+
+  useEffect(() => {
+    const convos = loadConversations();
+    setConversations(convos);
+    const savedId = loadActiveId();
+    if (savedId && convos.some((c) => c.id === savedId)) {
+      setActiveConvoId(savedId);
+    }
+    setApiUrl(loadSavedApiUrl());
+  }, []);
+
+  // ── Persistence: save on change ────────────────────────────────────────
+
+  useEffect(() => {
+    if (conversations.length > 0) saveConversations(conversations);
+  }, [conversations]);
+
+  useEffect(() => {
+    saveActiveId(activeConvoId);
+  }, [activeConvoId]);
+
+  // ── Auto-scroll ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // ── Wallet ─────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (typeof window.ethereum !== 'undefined') {
-      window.ethereum
-        .request({ method: 'eth_accounts' })
-        .then((accounts: string[]) => {
-          if (accounts.length > 0) {
-            setWalletAddress(accounts[0]);
-            setIsConnected(true);
-            setFaucetAddress(accounts[0]);
-          }
-        });
+      window.ethereum.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
+        if (accounts.length > 0) {
+          setWalletAddress(accounts[0]);
+          setIsConnected(true);
+        }
+      });
     }
   }, []);
 
   const connectWallet = async () => {
+    if (typeof window.ethereum === 'undefined') return;
     try {
-      if (typeof window.ethereum === 'undefined') {
-        setError('MetaMask is not installed. Please install MetaMask to continue.');
-        return;
-      }
-
-      setLoading(true);
-      setError('');
-
-      const accounts = await window.ethereum.request({
-        method: 'eth_requestAccounts',
-      });
-
+      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
       if (accounts.length > 0) {
         setWalletAddress(accounts[0]);
         setIsConnected(true);
-        setFaucetAddress(accounts[0]);
       }
-    } catch (err: any) {
-      setError(`Failed to connect wallet: ${err.message}`);
-    } finally {
-      setLoading(false);
-    }
+    } catch { /* user rejected */ }
   };
 
   const disconnectWallet = () => {
     setWalletAddress('');
     setIsConnected(false);
-    setResponse(null);
-    setError('');
-    setPaymentInfo('');
-    setFaucetAddress('');
-    setFaucetResponse(null);
-    setFaucetError('');
   };
 
-  const callApiWithPayment = async () => {
+  // ── Conversation management ────────────────────────────────────────────
+
+  const updateConversation = useCallback(
+    (id: string, updater: (c: Conversation) => Conversation) => {
+      setConversations((prev) => prev.map((c) => (c.id === id ? updater(c) : c)));
+    },
+    [],
+  );
+
+  const newConversation = useCallback(() => {
+    const convo: Conversation = {
+      id: generateId(),
+      title: 'New chat',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      apiUrl: apiUrl,
+    };
+    setConversations((prev) => [convo, ...prev]);
+    setActiveConvoId(convo.id);
+    setInput('');
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }, [apiUrl]);
+
+  const deleteConversation = useCallback(
+    (id: string) => {
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      if (activeConvoId === id) {
+        setActiveConvoId(null);
+      }
+    },
+    [activeConvoId],
+  );
+
+  const clearAllConversations = useCallback(() => {
+    setConversations([]);
+    setActiveConvoId(null);
+    localStorage.removeItem(config.storage.conversations);
+    localStorage.removeItem(config.storage.activeConversation);
+  }, []);
+
+  // ── Send message ───────────────────────────────────────────────────────
+
+  const sendMessage = async () => {
+    const trimmed = input.trim();
+    if (!trimmed || loading) return;
+
+    if (!isConnected) {
+      return;
+    }
+
+    const currentUrl = apiUrl.trim();
+    if (!currentUrl) {
+      setShowSettings(true);
+      return;
+    }
+
+    // Save apiUrl to localStorage whenever user sends
+    saveApiUrl(currentUrl);
+
+    let convoId = activeConvoId;
+
+    // Auto-create a conversation if none is active
+    if (!convoId) {
+      const convo: Conversation = {
+        id: generateId(),
+        title: deriveTitle(trimmed),
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        apiUrl: currentUrl,
+      };
+      setConversations((prev) => [convo, ...prev]);
+      setActiveConvoId(convo.id);
+      convoId = convo.id;
+    }
+
+    const userMsg: Message = { id: generateId(), role: 'user', content: trimmed, timestamp: Date.now() };
+
+    // Append user message & set title if first message
+    updateConversation(convoId, (c) => ({
+      ...c,
+      messages: [...c.messages, userMsg],
+      title: c.messages.length === 0 ? deriveTitle(trimmed) : c.title,
+      updatedAt: Date.now(),
+    }));
+
+    setInput('');
+    setLoading(true);
+
     try {
-      if (!isConnected) {
-        setError('Please connect your wallet first');
-        return;
-      }
+      const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+      if (!accounts?.length) throw new Error('No accounts found. Please connect your wallet.');
 
-      if (!apiUrl.trim()) {
-        setError('Please enter an API URL');
-        return;
-      }
-
-      if (!prompt.trim()) {
-        setError('Please enter a prompt');
-        return;
-      }
-
-      setLoading(true);
-      setError('');
-      setResponse(null);
-      setPaymentInfo('');
-
-      const accounts = await window.ethereum.request({
-        method: 'eth_accounts',
-      });
-
-      if (!accounts || accounts.length === 0) {
-        throw new Error('No accounts found. Please connect MetaMask.');
+      // Switch to Base Sepolia
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: config.chain.idHex }],
+        });
+      } catch (switchError: any) {
+        if (switchError.code === 4902) {
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [{
+              chainId: config.chain.idHex,
+              chainName: config.chain.name,
+              nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+              rpcUrls: [config.chain.rpcUrl],
+              blockExplorerUrls: [config.chain.explorerUrl],
+            }],
+          });
+        } else {
+          throw new Error('Please switch to Base Sepolia network in your wallet');
+        }
       }
 
       const walletClient = createWalletClient({
@@ -118,553 +372,349 @@ const ZyndTester: React.FC = () => {
         transport: custom(window.ethereum),
       });
 
-      const amountInBaseUnits = BigInt(Math.floor(parseFloat(amount) * 1000000));
+      const fetchWithPay = wrapFetchWithPayment(fetch, walletClient as any);
 
-      const fetchWithPay = wrapFetchWithPayment(
-        fetch,
-        walletClient as any,
-        amountInBaseUnits
-      );
-
-      setPaymentInfo('Initiating request...');
-
-      const apiResponse = await fetchWithPay(apiUrl, {
+      const apiResponse = await fetchWithPay(currentUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ prompt }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: trimmed }),
       });
-
-      if (apiResponse.status === 402) {
-        setPaymentInfo('Payment required - processing...');
-        throw new Error('Payment required but not automatically handled');
-      }
-
-      setPaymentInfo('Request completed successfully!');
 
       const data = await apiResponse.json();
-      setResponse({
-        status: apiResponse.status,
-        statusText: apiResponse.statusText,
-        data: data,
-      });
+      const content = extractContent(data);
 
-      console.log('API Response:', data);
+      const assistantMsg: Message = { id: generateId(), role: 'assistant', content, timestamp: Date.now() };
+
+      updateConversation(convoId, (c) => ({
+        ...c,
+        messages: [...c.messages, assistantMsg],
+        updatedAt: Date.now(),
+      }));
     } catch (err: any) {
-      console.error('Error calling API:', err);
-      setError(`Request failed: ${err.message}`);
-      setPaymentInfo('');
+      const errMsg: Message = {
+        id: generateId(),
+        role: 'error',
+        content: err.message || 'Something went wrong',
+        timestamp: Date.now(),
+      };
+      updateConversation(convoId, (c) => ({
+        ...c,
+        messages: [...c.messages, errMsg],
+        updatedAt: Date.now(),
+      }));
     } finally {
       setLoading(false);
     }
   };
 
-  const claimFaucet = async () => {
-    try {
-      if (!faucetAddress.trim()) {
-        setFaucetError('Please enter a wallet address');
-        return;
-      }
+  // ── Key handler ────────────────────────────────────────────────────────
 
-      const addressRegex = /^0x[a-fA-F0-9]{40}$/;
-      if (!addressRegex.test(faucetAddress)) {
-        setFaucetError('Invalid wallet address format');
-        return;
-      }
-
-      setFaucetLoading(true);
-      setFaucetError('');
-      setFaucetResponse(null);
-
-      const response = await fetch('/api/faucet', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ walletAddress: faucetAddress }),
-      });
-
-      const data = await response.json();
-
-      if (data.success) {
-        setFaucetResponse(data);
-      } else {
-        setFaucetError(data.error || 'Failed to claim tokens');
-      }
-    } catch (err: any) {
-      console.error('Error claiming faucet:', err);
-      setFaucetError(`Failed to claim: ${err.message}`);
-    } finally {
-      setFaucetLoading(false);
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
     }
   };
 
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
-      {/* Header */}
-      <div className="border-b border-white/10 backdrop-blur-sm bg-black/20 sticky top-0 z-50">
-        <div className="max-w-5xl mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center">
-                <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-              </div>
-              <span className="text-2xl font-bold bg-gradient-to-r from-violet-400 to-fuchsia-400 bg-clip-text text-transparent">
-                Zynd Tester
-              </span>
-            </div>
+  // Auto-resize textarea
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    const el = e.target;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+  };
 
-            {/* Wallet Status */}
+  // ── Render ─────────────────────────────────────────────────────────────
+
+  return (
+    <div className="h-screen flex bg-[#171717] text-gray-100">
+      {/* ── Sidebar ─────────────────────────────────────────────────────── */}
+      <div
+        className={`${sidebarOpen ? 'w-64' : 'w-0'} flex-shrink-0 bg-[#0f0f0f] border-r border-white/5 flex flex-col transition-all duration-200 overflow-hidden`}
+      >
+        {/* New chat button */}
+        <div className="p-3">
+          <button
+            onClick={newConversation}
+            className="w-full flex items-center gap-2 px-3 py-2.5 rounded-lg border border-white/10 hover:bg-white/5 transition-colors text-sm"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            New chat
+          </button>
+        </div>
+
+        {/* Conversation list */}
+        <div className="flex-1 overflow-y-auto px-2 space-y-0.5 scrollbar-thin">
+          {conversations.map((c) => (
+            <div
+              key={c.id}
+              className={`group flex items-center gap-2 px-3 py-2.5 rounded-lg cursor-pointer text-sm transition-colors
+                         ${c.id === activeConvoId ? 'bg-white/10 text-white' : 'text-gray-400 hover:bg-white/5 hover:text-gray-200'}`}
+              onClick={() => {
+                setActiveConvoId(c.id);
+                setApiUrl(c.apiUrl || apiUrl);
+              }}
+            >
+              <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+              <span className="truncate flex-1">{c.title}</span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deleteConversation(c.id);
+                }}
+                className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-red-400 transition-all"
+                title="Delete conversation"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
+
+        {/* Sidebar footer */}
+        <div className="p-3 border-t border-white/5 space-y-1">
+          <Link
+            href="/faucet"
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-blue-400 hover:bg-white/5 transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Claim Tokens
+          </Link>
+          {conversations.length > 0 && (
+            <button
+              onClick={clearAllConversations}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-gray-500 hover:text-red-400 hover:bg-white/5 transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+              Clear all conversations
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Main area ───────────────────────────────────────────────────── */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Header */}
+        <div className="h-12 flex items-center justify-between px-4 border-b border-white/5 bg-[#171717] shrink-0">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-1 hover:bg-white/5 rounded transition-colors">
+              <svg className="w-5 h-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <span className="text-sm font-medium text-gray-300">{config.app.name}</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Settings button */}
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className={`p-1.5 rounded transition-colors ${showSettings ? 'bg-white/10 text-white' : 'hover:bg-white/5 text-gray-400'}`}
+              title="Settings"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+
+            {/* Wallet */}
             {isConnected ? (
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/20 border border-emerald-500/30">
-                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
-                  <span className="text-sm text-emerald-400 font-mono">
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20">
+                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-400"></div>
+                  <span className="text-xs text-emerald-400 font-mono">
                     {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
                   </span>
                 </div>
-                <button
-                  onClick={disconnectWallet}
-                  className="text-sm text-gray-400 hover:text-white transition-colors"
-                >
+                <button onClick={disconnectWallet} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
                   Disconnect
                 </button>
               </div>
             ) : (
               <button
                 onClick={connectWallet}
-                disabled={loading}
-                className="px-4 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500
-                         text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed
-                         shadow-lg shadow-violet-500/25 hover:shadow-violet-500/40"
+                className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm text-white transition-colors"
               >
-                {loading ? 'Connecting...' : 'Connect Wallet'}
+                Connect Wallet
               </button>
             )}
           </div>
-
-          {/* Navigation Tabs */}
-          <div className="flex gap-1 mt-4 p-1 bg-white/5 rounded-xl w-fit">
-            <button
-              onClick={() => setActiveTab('tester')}
-              className={`px-5 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2
-                        ${activeTab === 'tester'
-                          ? 'bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white shadow-lg'
-                          : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-              Test Agent
-            </button>
-            <button
-              onClick={() => setActiveTab('faucet')}
-              className={`px-5 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2
-                        ${activeTab === 'faucet'
-                          ? 'bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white shadow-lg'
-                          : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              Claim Tokens
-            </button>
-          </div>
         </div>
-      </div>
 
-      <div className="max-w-5xl mx-auto px-4 py-8">
-        {/* API Tester Tab */}
-        {activeTab === 'tester' && (
-          <>
-            {/* Main Card */}
-            <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 overflow-hidden shadow-2xl">
-              <div className="px-6 py-4 border-b border-white/10 bg-white/5">
-                <h2 className="text-lg font-semibold text-white">API Request Configuration</h2>
-                <p className="text-sm text-gray-400 mt-1">Configure your x402 payment-enabled API request</p>
-              </div>
-
-              <div className="p-6 space-y-6">
-                {/* URL Input */}
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium text-gray-300">
-                    API Endpoint URL
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                      <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                      </svg>
-                    </div>
-                    <input
-                      type="url"
-                      value={apiUrl}
-                      onChange={(e) => setApiUrl(e.target.value)}
-                      placeholder="https://api.example.com/endpoint"
-                      className="w-full pl-12 pr-4 py-3 rounded-xl bg-black/30 border border-white/10 text-white placeholder-gray-500
-                               focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 transition-all
-                               font-mono text-sm"
-                    />
-                  </div>
-                </div>
-
-                {/* Amount Input */}
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium text-gray-300">
-                    Maximum Payment Amount
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                      <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                      </svg>
-                    </div>
-                    <input
-                      type="number"
-                      step="0.001"
-                      min="0"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="0.01"
-                      className="w-full pl-12 pr-20 py-3 rounded-xl bg-black/30 border border-white/10 text-white placeholder-gray-500
-                               focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 transition-all
-                               font-mono text-sm"
-                    />
-                    <div className="absolute inset-y-0 right-0 pr-4 flex items-center pointer-events-none">
-                      <span className="text-sm font-medium text-violet-400">USDC</span>
-                    </div>
-                  </div>
-                  <p className="text-xs text-gray-500">This is the maximum amount you&apos;re willing to pay for this API call</p>
-                </div>
-
-                {/* Prompt Input */}
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium text-gray-300">
-                    Prompt
-                  </label>
-                  <textarea
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    placeholder="Enter your prompt here..."
-                    rows={4}
-                    className="w-full px-4 py-3 rounded-xl bg-black/30 border border-white/10 text-white placeholder-gray-500
-                             focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 transition-all
-                             resize-none text-sm"
-                  />
-                </div>
-
-                {/* Submit Button */}
-                <button
-                  onClick={callApiWithPayment}
-                  disabled={!isConnected || loading || !apiUrl.trim() || !prompt.trim()}
-                  className={`w-full py-4 rounded-xl font-semibold text-white transition-all duration-300
-                            flex items-center justify-center gap-2 text-base
-                            ${isConnected && !loading && apiUrl.trim() && prompt.trim()
-                              ? 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 shadow-lg shadow-violet-500/25 hover:shadow-violet-500/40 hover:scale-[1.02]'
-                              : 'bg-gray-700/50 cursor-not-allowed'}`}
-                >
-                  {loading ? (
-                    <>
-                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      Processing Request...
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                      Send Request
-                    </>
-                  )}
-                </button>
-
-                {/* Payment Info */}
-                {paymentInfo && (
-                  <div className="flex items-center gap-3 p-4 rounded-xl bg-violet-500/10 border border-violet-500/20">
-                    <div className="w-8 h-8 rounded-full bg-violet-500/20 flex items-center justify-center shrink-0">
-                      <svg className="w-4 h-4 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                      </svg>
-                    </div>
-                    <p className="text-violet-300 text-sm">{paymentInfo}</p>
-                  </div>
-                )}
-              </div>
+        {/* Settings panel */}
+        {showSettings && (
+          <div className="border-b border-white/5 bg-[#1a1a1a] px-4 py-3">
+            <div className="max-w-3xl mx-auto">
+              <label className="block text-xs text-gray-400 mb-1.5">API Endpoint URL</label>
+              <input
+                type="url"
+                value={apiUrl}
+                onChange={(e) => {
+                  setApiUrl(e.target.value);
+                  saveApiUrl(e.target.value);
+                }}
+                placeholder="https://api.example.com/endpoint"
+                className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-white placeholder-gray-600 font-mono text-sm
+                         focus:outline-none focus:ring-1 focus:ring-violet-500/50 focus:border-violet-500/50 transition-all"
+              />
+              <p className="text-xs text-gray-600 mt-1">The x402 payment-enabled API endpoint to send prompts to</p>
             </div>
-
-            {/* Error Display */}
-            {error && (
-              <div className="mt-6 flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/20">
-                <div className="w-8 h-8 rounded-full bg-red-500/20 flex items-center justify-center shrink-0">
-                  <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="text-red-400 font-medium text-sm">Error</p>
-                  <p className="text-red-300/80 text-sm mt-0.5">{error}</p>
-                </div>
-              </div>
-            )}
-
-            {/* Response Display */}
-            {response && (
-              <div className="mt-6 bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 overflow-hidden">
-                <div className="px-6 py-4 border-b border-white/10 bg-white/5 flex items-center justify-between">
-                  <h3 className="text-lg font-semibold text-white">Response</h3>
-                  <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium
-                                ${response.status >= 200 && response.status < 300
-                                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                                  : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'}`}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${response.status >= 200 && response.status < 300 ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
-                    {response.status} {response.statusText}
-                  </span>
-                </div>
-                <div className="p-6">
-                  <pre className="bg-black/40 text-gray-100 p-4 rounded-xl overflow-auto text-sm font-mono max-h-96 border border-white/5">
-                    {JSON.stringify(response.data, null, 2)}
-                  </pre>
-                </div>
-              </div>
-            )}
-
-            {/* Info Box */}
-            <div className="mt-6 p-5 rounded-xl bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10 border border-violet-500/20">
-              <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-full bg-violet-500/20 flex items-center justify-center shrink-0">
-                  <svg className="w-4 h-4 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                  </svg>
-                </div>
-                <div>
-                  <h4 className="text-sm font-semibold text-violet-300 mb-2">How it works</h4>
-                  <ul className="text-sm text-gray-400 space-y-1.5">
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-violet-400"></span>
-                      Connect your MetaMask wallet (Base Sepolia testnet)
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-violet-400"></span>
-                      Enter the API endpoint URL and your prompt
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-violet-400"></span>
-                      Set the maximum USDC amount you&apos;re willing to pay
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-violet-400"></span>
-                      x402 automatically handles payment if required (402 response)
-                    </li>
-                  </ul>
-                </div>
-              </div>
-            </div>
-          </>
+          </div>
         )}
 
-        {/* Faucet Tab */}
-        {activeTab === 'faucet' && (
-          <>
-            {/* Hero Section */}
-            <div className="text-center mb-8">
-              <div className="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-500 to-cyan-500 mb-4 shadow-lg shadow-blue-500/25">
-                <span className="text-4xl">🚰</span>
+        {/* ── Messages area ─────────────────────────────────────────────── */}
+        <div className="flex-1 overflow-y-auto scrollbar-thin">
+          {messages.length === 0 ? (
+            /* Empty state */
+            <div className="h-full flex flex-col items-center justify-center px-4">
+              <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-600 to-fuchsia-600 flex items-center justify-center mb-6">
+                <svg className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
               </div>
-              <div className="inline-block px-4 py-1.5 rounded-full bg-blue-500/20 border border-blue-500/30 text-blue-400 text-sm font-medium mb-3">
-                Base Sepolia Testnet
-              </div>
-              <h2 className="text-3xl font-bold text-white mb-2">Claim Testnet ETH</h2>
-              <p className="text-gray-400">Get free testnet ETH for development and testing</p>
+              <h2 className="text-xl font-medium text-white mb-2">How can I help you today?</h2>
+              <p className="text-sm text-gray-500 mb-8 text-center max-w-md">
+                Send a message to any x402 payment-enabled API. Payments are handled automatically via your connected wallet.
+              </p>
+              {!apiUrl.trim() && (
+                <button
+                  onClick={() => setShowSettings(true)}
+                  className="px-4 py-2 rounded-lg border border-white/10 text-sm text-gray-400 hover:bg-white/5 hover:text-gray-200 transition-colors"
+                >
+                  Set up API endpoint to get started
+                </button>
+              )}
             </div>
+          ) : (
+            <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+              {messages.map((msg) => (
+                <div key={msg.id} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                  {/* Avatar for assistant / error */}
+                  {msg.role !== 'user' && (
+                    <div
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${
+                        msg.role === 'error'
+                          ? 'bg-red-500/20'
+                          : 'bg-gradient-to-br from-violet-600 to-fuchsia-600'
+                      }`}
+                    >
+                      {msg.role === 'error' ? (
+                        <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                      )}
+                    </div>
+                  )}
 
-            {/* Info Cards */}
-            <div className="grid grid-cols-3 gap-4 mb-8">
-              <div className="bg-white/5 backdrop-blur-xl rounded-xl border border-white/10 p-5 text-center hover:bg-white/10 transition-colors">
-                <div className="text-2xl mb-2">💰</div>
-                <div className="text-2xl font-bold text-blue-400 mb-1">0.01</div>
-                <div className="text-xs text-gray-500 uppercase tracking-wide">ETH Amount</div>
-              </div>
-              <div className="bg-white/5 backdrop-blur-xl rounded-xl border border-white/10 p-5 text-center hover:bg-white/10 transition-colors">
-                <div className="text-2xl mb-2">⚡</div>
-                <div className="text-2xl font-bold text-blue-400 mb-1">Fast</div>
-                <div className="text-xs text-gray-500 uppercase tracking-wide">Instant</div>
-              </div>
-              <div className="bg-white/5 backdrop-blur-xl rounded-xl border border-white/10 p-5 text-center hover:bg-white/10 transition-colors">
-                <div className="text-2xl mb-2">🔒</div>
-                <div className="text-2xl font-bold text-blue-400 mb-1">1x</div>
-                <div className="text-xs text-gray-500 uppercase tracking-wide">Per Wallet</div>
-              </div>
-            </div>
+                  {/* Message bubble */}
+                  <div
+                    className={`max-w-[85%] ${
+                      msg.role === 'user'
+                        ? 'bg-[#2f2f2f] rounded-2xl rounded-tr-sm px-4 py-3'
+                        : msg.role === 'error'
+                          ? 'bg-red-500/5 border border-red-500/20 rounded-2xl rounded-tl-sm px-4 py-3 text-red-300'
+                          : 'flex-1 min-w-0'
+                    }`}
+                  >
+                    {msg.role === 'user' ? (
+                      <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                    ) : msg.role === 'error' ? (
+                      <p className="text-sm">{msg.content}</p>
+                    ) : (
+                      <div className="prose-chat text-sm text-gray-200">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    )}
+                  </div>
 
-            {/* Main Card */}
-            <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 overflow-hidden shadow-2xl">
-              <div className="px-6 py-4 border-b border-white/10 bg-white/5">
-                <h3 className="text-lg font-semibold text-white">Claim Your Tokens</h3>
-                <p className="text-sm text-gray-400 mt-1">Enter your wallet address to receive 0.01 ETH</p>
-              </div>
-
-              <div className="p-6 space-y-6">
-                {/* Wallet Address Input */}
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium text-gray-300">
-                    Wallet Address
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                      <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+                  {/* Avatar for user */}
+                  {msg.role === 'user' && (
+                    <div className="w-8 h-8 rounded-lg bg-[#2f2f2f] border border-white/10 flex items-center justify-center shrink-0 mt-0.5">
+                      <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                       </svg>
                     </div>
-                    <input
-                      type="text"
-                      value={faucetAddress}
-                      onChange={(e) => setFaucetAddress(e.target.value)}
-                      placeholder="0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-                      className="w-full pl-12 pr-4 py-3 rounded-xl bg-black/30 border border-white/10 text-white placeholder-gray-500
-                               focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 transition-all
-                               font-mono text-sm"
-                    />
-                  </div>
-                  {isConnected && (
-                    <button
-                      onClick={() => setFaucetAddress(walletAddress)}
-                      className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
-                    >
-                      Use connected wallet address
-                    </button>
                   )}
                 </div>
+              ))}
 
-                {/* Submit Button */}
-                <button
-                  onClick={claimFaucet}
-                  disabled={faucetLoading || !faucetAddress.trim()}
-                  className={`w-full py-4 rounded-xl font-semibold text-white transition-all duration-300
-                            flex items-center justify-center gap-2 text-base
-                            ${!faucetLoading && faucetAddress.trim()
-                              ? 'bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 hover:scale-[1.02]'
-                              : 'bg-gray-700/50 cursor-not-allowed'}`}
-                >
-                  {faucetLoading ? (
-                    <>
-                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-lg">🎁</span>
-                      Claim Testnet ETH
-                    </>
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Faucet Error Display */}
-            {faucetError && (
-              <div className="mt-6 flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/20">
-                <div className="w-8 h-8 rounded-full bg-red-500/20 flex items-center justify-center shrink-0">
-                  <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="text-red-400 font-medium text-sm">Error</p>
-                  <p className="text-red-300/80 text-sm mt-0.5">{faucetError}</p>
-                </div>
-              </div>
-            )}
-
-            {/* Faucet Success Display */}
-            {faucetResponse && (
-              <div className="mt-6 bg-white/5 backdrop-blur-xl rounded-2xl border border-emerald-500/30 overflow-hidden">
-                <div className="px-6 py-4 border-b border-white/10 bg-emerald-500/10 flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full bg-emerald-500/20 flex items-center justify-center">
-                    <svg className="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              {/* Typing indicator */}
+              {loading && (
+                <div className="flex gap-4">
+                  <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-fuchsia-600 flex items-center justify-center shrink-0 mt-0.5">
+                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                     </svg>
                   </div>
-                  <div>
-                    <h3 className="text-lg font-semibold text-emerald-400">Success!</h3>
-                    <p className="text-sm text-emerald-300/80">{faucetResponse.amount} ETH has been sent to your wallet</p>
+                  <div className="flex items-center gap-1.5 py-3">
+                    <div className="w-2 h-2 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                    <div className="w-2 h-2 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                    <div className="w-2 h-2 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '300ms' }}></div>
                   </div>
                 </div>
-                <div className="p-6">
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between p-3 rounded-lg bg-black/20">
-                      <span className="text-sm text-gray-400">Recipient</span>
-                      <span className="text-sm text-white font-mono">{faucetResponse.recipient?.slice(0, 10)}...{faucetResponse.recipient?.slice(-8)}</span>
-                    </div>
-                    <div className="flex items-center justify-between p-3 rounded-lg bg-black/20">
-                      <span className="text-sm text-gray-400">Amount</span>
-                      <span className="text-sm text-white font-medium">{faucetResponse.amount} ETH</span>
-                    </div>
-                    <a
-                      href={faucetResponse.explorerUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center justify-center gap-2 w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
-                    >
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                      </svg>
-                      View Transaction
-                    </a>
-                  </div>
-                </div>
-              </div>
-            )}
+              )}
 
-            {/* Info Box */}
-            <div className="mt-6 p-5 rounded-xl bg-gradient-to-r from-blue-500/10 to-cyan-500/10 border border-blue-500/20">
-              <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-full bg-blue-500/20 flex items-center justify-center shrink-0">
-                  <svg className="w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <div>
-                  <h4 className="text-sm font-semibold text-blue-300 mb-2">About this faucet</h4>
-                  <ul className="text-sm text-gray-400 space-y-1.5">
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
-                      Each wallet can only claim once
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
-                      You&apos;ll receive 0.01 Base Sepolia ETH
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
-                      Network: Base Sepolia (Chain ID: 84532)
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400"></span>
-                      Use testnet ETH for development and testing only
-                    </li>
-                  </ul>
-                </div>
-              </div>
+              <div ref={messagesEndRef} />
             </div>
-          </>
-        )}
-      </div>
+          )}
+        </div>
 
-      {/* Footer */}
-      <div className="border-t border-white/5 mt-auto">
-        <div className="max-w-5xl mx-auto px-4 py-4">
-          <p className="text-center text-xs text-gray-500">
-            Powered by x402 Protocol | Base Sepolia Testnet
-          </p>
+        {/* ── Input area ────────────────────────────────────────────────── */}
+        <div className="shrink-0 border-t border-white/5 bg-[#171717] px-4 py-3">
+          <div className="max-w-3xl mx-auto">
+            <div className="relative flex items-end bg-[#2f2f2f] rounded-xl border border-white/10 focus-within:border-white/20 transition-colors">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  !isConnected
+                    ? 'Connect your wallet to start...'
+                    : !apiUrl.trim()
+                      ? 'Set an API endpoint in settings first...'
+                      : 'Message...'
+                }
+                disabled={!isConnected || loading}
+                rows={1}
+                className="flex-1 bg-transparent text-sm text-white placeholder-gray-500 px-4 py-3 resize-none
+                         focus:outline-none disabled:opacity-50 max-h-[200px] scrollbar-thin"
+              />
+              <button
+                onClick={sendMessage}
+                disabled={!input.trim() || !isConnected || loading || !apiUrl.trim()}
+                className={`m-1.5 p-2 rounded-lg transition-all ${
+                  input.trim() && isConnected && !loading && apiUrl.trim()
+                    ? 'bg-white text-black hover:bg-gray-200'
+                    : 'bg-white/10 text-gray-600 cursor-not-allowed'
+                }`}
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            </div>
+            <p className="text-center text-xs text-gray-600 mt-2">
+              Powered by x402 Protocol &middot; {config.chain.name}
+            </p>
+          </div>
         </div>
       </div>
     </div>
